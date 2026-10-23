@@ -1,0 +1,177 @@
+name: Verify SpaceApp 62 on Linux
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - change.patch
+      - .github/workflows/verify.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: spaceapp-62-linux-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    # This harness is intended only for a public repository and the standard
+    # hosted runner. A private-repository skip is not a successful verification.
+    if: github.event.repository.private == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      UPSTREAM_SHA: 0fb6b224a62a4a99ce08917435f3a42b85b514a8
+      NODE_VERSION: 22.23.4
+      NODE_ARCHIVE_SHA256: 1805bcd35e6815559bd2eb97db438d3fdb0eb3a5e6a977b7c1badca76337e9ce
+      ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+      NPM_CONFIG_FUND: 'false'
+      NPM_CONFIG_AUDIT: 'false'
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Fetch the exact verification payload and upstream commit
+        id: prepare
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$RUNNER_TEMP/spaceapp-62-logs"
+          exec > >(tee "$RUNNER_TEMP/spaceapp-62-logs/prepare.log") 2>&1
+          printf 'runner_os=%s\nrunner_arch=%s\n' "$RUNNER_OS" "$RUNNER_ARCH"
+          uname -a
+          test "$RUNNER_OS" = Linux
+          test "$RUNNER_ARCH" = X64
+          printf 'payload_repository=%s\npayload_commit=%s\nupstream_commit=%s\n' "$GITHUB_REPOSITORY" "$GITHUB_SHA" "$UPSTREAM_SHA"
+          git init "$GITHUB_WORKSPACE/payload"
+          git -C "$GITHUB_WORKSPACE/payload" remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
+          git -C "$GITHUB_WORKSPACE/payload" fetch --depth=1 origin "$GITHUB_SHA"
+          git -C "$GITHUB_WORKSPACE/payload" checkout --detach FETCH_HEAD
+          test "$(git -C "$GITHUB_WORKSPACE/payload" rev-parse HEAD)" = "$GITHUB_SHA"
+          test -s "$GITHUB_WORKSPACE/payload/change.patch"
+          sha256sum "$GITHUB_WORKSPACE/payload/change.patch"
+          git init "$GITHUB_WORKSPACE/source"
+          git -C "$GITHUB_WORKSPACE/source" remote add origin https://github.com/oll4com/spaceapp.git
+          git -C "$GITHUB_WORKSPACE/source" fetch --depth=1 origin "$UPSTREAM_SHA"
+          git -C "$GITHUB_WORKSPACE/source" checkout --detach FETCH_HEAD
+          test "$(git -C "$GITHUB_WORKSPACE/source" rev-parse HEAD)" = "$UPSTREAM_SHA"
+          git -C "$GITHUB_WORKSPACE/source" switch -c verify-spaceapp-62
+          git -C "$GITHUB_WORKSPACE/source" apply --check "$GITHUB_WORKSPACE/payload/change.patch"
+          git -C "$GITHUB_WORKSPACE/source" apply --index "$GITHUB_WORKSPACE/payload/change.patch"
+          git -C "$GITHUB_WORKSPACE/source" diff --cached --check
+          git -C "$GITHUB_WORKSPACE/source" diff --cached --stat
+          git -C "$GITHUB_WORKSPACE/source" status --short
+
+      - name: Install and checksum official Node 22.23.4
+        id: node
+        timeout-minutes: 10
+        run: |
+          set -Eeuo pipefail
+          exec > >(tee "$RUNNER_TEMP/spaceapp-62-logs/node.log") 2>&1
+          archive="node-v${NODE_VERSION}-linux-x64.tar.xz"
+          mkdir -p "$RUNNER_TEMP/spaceapp-62-node"
+          cd "$RUNNER_TEMP/spaceapp-62-node"
+          curl --fail --silent --show-error --location --retry 3 --connect-timeout 20 \
+            --output "$archive" "https://nodejs.org/dist/v${NODE_VERSION}/${archive}"
+          printf '%s  %s\n' "$NODE_ARCHIVE_SHA256" "$archive" | sha256sum --check --strict
+          tar -xJf "$archive"
+          node_bin="$RUNNER_TEMP/spaceapp-62-node/node-v${NODE_VERSION}-linux-x64/bin"
+          printf '%s\n' "$node_bin" >> "$GITHUB_PATH"
+          test "$("$node_bin/node" --version)" = "v${NODE_VERSION}"
+          "$node_bin/node" --version
+          PATH="$node_bin:$PATH" "$node_bin/npm" --version
+
+      - name: Install locked dependencies
+        id: install
+        timeout-minutes: 20
+        working-directory: source
+        run: |
+          set -Eeuo pipefail
+          test "$(node --version)" = "v${NODE_VERSION}"
+          npm ci 2>&1 | tee "$RUNNER_TEMP/spaceapp-62-logs/npm-ci.log"
+
+      # Each verification stage keeps its own true exit status. Later stages may
+      # still run after another stage fails so all available evidence is kept;
+      # no stage uses continue-on-error, and a failed stage fails the job.
+      - name: Check
+        id: check
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        timeout-minutes: 25
+        working-directory: source
+        run: |
+          set -Eeuo pipefail
+          npm run check 2>&1 | tee "$RUNNER_TEMP/spaceapp-62-logs/check.log"
+
+      - name: Issue 62 Web memory regressions
+        id: memory_web
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        timeout-minutes: 15
+        working-directory: source
+        run: |
+          set -Eeuo pipefail
+          npm test -w @space/web -- memory 2>&1 | tee "$RUNNER_TEMP/spaceapp-62-logs/memory-web.log"
+
+      - name: Issue 62 API memory graph regressions
+        id: memory_api
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        timeout-minutes: 15
+        working-directory: source
+        run: |
+          set -Eeuo pipefail
+          npm test -w @space/api -- memory-graph 2>&1 | tee "$RUNNER_TEMP/spaceapp-62-logs/memory-api.log"
+
+      - name: Full public test suite
+        id: test
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        timeout-minutes: 45
+        working-directory: source
+        run: |
+          set -Eeuo pipefail
+          npm test 2>&1 | tee "$RUNNER_TEMP/spaceapp-62-logs/test.log"
+
+      - name: Build
+        id: build
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        timeout-minutes: 25
+        working-directory: source
+        run: |
+          set -Eeuo pipefail
+          npm run build 2>&1 | tee "$RUNNER_TEMP/spaceapp-62-logs/build.log"
+
+      - name: Hygiene preflight on the staged patch
+        id: hygiene
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        timeout-minutes: 5
+        working-directory: source
+        run: |
+          set -Eeuo pipefail
+          git status --short
+          npm run hygiene:preflight 2>&1 | tee "$RUNNER_TEMP/spaceapp-62-logs/hygiene.log"
+
+      - name: Record actual outcomes and log location
+        if: always()
+        env:
+          PREPARE_OUTCOME: ${{ steps.prepare.outcome }}
+          NODE_OUTCOME: ${{ steps.node.outcome }}
+          INSTALL_OUTCOME: ${{ steps.install.outcome }}
+          CHECK_OUTCOME: ${{ steps.check.outcome }}
+          MEMORY_WEB_OUTCOME: ${{ steps.memory_web.outcome }}
+          MEMORY_API_OUTCOME: ${{ steps.memory_api.outcome }}
+          TEST_OUTCOME: ${{ steps.test.outcome }}
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+          HYGIENE_OUTCOME: ${{ steps.hygiene.outcome }}
+        run: |
+          set -Eeuo pipefail
+          {
+            printf '## SpaceApp 62 Linux verification\n\n'
+            printf 'Upstream: `%s`\n\nPayload commit: `%s`\n\n' "$UPSTREAM_SHA" "$GITHUB_SHA"
+            printf '| Stage | Actual outcome |\n|---|---|\n'
+            printf '| Prepare | %s |\n| Node | %s |\n| npm ci | %s |\n' "$PREPARE_OUTCOME" "$NODE_OUTCOME" "$INSTALL_OUTCOME"
+            printf '| check | %s |\n| Web memory regressions | %s |\n| API memory graph regressions | %s |\n' "$CHECK_OUTCOME" "$MEMORY_WEB_OUTCOME" "$MEMORY_API_OUTCOME"
+            printf '| Full public test suite | %s |\n| build | %s |\n| hygiene | %s |\n\n' "$TEST_OUTCOME" "$BUILD_OUTCOME" "$HYGIENE_OUTCOME"
+            printf 'Read every failed/skipped stage. Skipped, timed-out or cancelled stages are not passes.\n\n'
+            printf 'Complete stdout/stderr is retained in this Actions run. Use the job menu → Download log archive. Temporary tee copies are not uploaded as artifacts.\n\n'
+            printf 'No test-source commit or DCO signature was created. Hygiene checks the staged patch; browser GPU performance and context recovery require separate real-device evidence.\n'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
